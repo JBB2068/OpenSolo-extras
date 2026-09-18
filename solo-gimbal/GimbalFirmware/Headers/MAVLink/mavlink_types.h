@@ -22,12 +22,36 @@
 #define MAVLINK_MAX_PAYLOAD_LEN 255 ///< Maximum payload length
 #endif
 
-#define MAVLINK_CORE_HEADER_LEN 5 ///< Length of core header (of the comm. layer): message length (1 byte) + message sequence (1 byte) + message system id (1 byte) + message component id (1 byte) + message type id (1 byte)
-#define MAVLINK_NUM_HEADER_BYTES (MAVLINK_CORE_HEADER_LEN + 1) ///< Length of all header bytes, including core and checksum
+/* ============================================================
+ * MAVLINK2 PATCH: wire-format markers and header-length macros
+ * ------------------------------------------------------------
+ * MAVLink1 and MAVLink2 packets are told apart by their first
+ * ("magic"/STX) byte, and have different core header lengths.
+ * We keep both defined so the parser/packer can support either
+ * on the wire, selected per-message via msg->magic.
+ * ============================================================ */
+#define MAVLINK_STX_MAVLINK1 0xFE ///< Marker to protocol MAVLink 1.0: sync byte, start of a new packet.
+#define MAVLINK_STX 0xFD          ///< Marker to protocol MAVLink 2.0: sync byte, start of a new packet.
+
+// MAVLink 1.0 core header: len, seq, sysid, compid, msgid(1 byte)  = 5 bytes
+#define MAVLINK_CORE_HEADER_MAVLINK1_LEN 5
+// MAVLink 2.0 core header: len, incompat_flags, compat_flags, seq, sysid, compid, msgid(3 bytes) = 9 bytes
+#define MAVLINK_CORE_HEADER_LEN 9
+
+// "Num header bytes" = magic byte + core header. Sized to the larger (v2) case so
+// buffers are always big enough for either version.
+#define MAVLINK_NUM_HEADER_BYTES_MAVLINK1 (MAVLINK_CORE_HEADER_MAVLINK1_LEN + 1) ///< 6
+#define MAVLINK_NUM_HEADER_BYTES (MAVLINK_CORE_HEADER_LEN + 1)                  ///< 10
+
 #define MAVLINK_NUM_CHECKSUM_BYTES 2
 #define MAVLINK_NUM_NON_PAYLOAD_BYTES (MAVLINK_NUM_HEADER_BYTES + MAVLINK_NUM_CHECKSUM_BYTES)
+#define MAVLINK_NUM_NON_PAYLOAD_BYTES_MAVLINK1 (MAVLINK_NUM_HEADER_BYTES_MAVLINK1 + MAVLINK_NUM_CHECKSUM_BYTES)
 
 #define MAVLINK_MAX_PACKET_LEN (MAVLINK_MAX_PAYLOAD_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES) ///< Maximum packet length
+
+// MAVLink2 incompatibility/compatibility flag bits (only SIGNED is defined by the spec
+// today; we don't set it since this patch does not implement packet signing).
+#define MAVLINK_IFLAG_SIGNED 0x01
 
 #define MAVLINK_MSG_ID_EXTENDED_MESSAGE 255
 #define MAVLINK_EXTENDED_HEADER_LEN 14
@@ -45,12 +69,6 @@
 
 /**
  * Old-style 4 byte param union
- *
- * This struct is the data format to be used when sending
- * parameters. The parameter should be copied to the native
- * type (without type conversion)
- * and re-instanted on the receiving side using the
- * native type as well.
  */
 MAVPACKED(
 typedef struct param_union {
@@ -70,17 +88,7 @@ typedef struct param_union {
 
 /**
  * New-style 8 byte param union
- * mavlink_param_union_double_t will be 8 bytes long, and treated as needing 8 byte alignment for the purposes of MAVLink 1.0 field ordering.
- * The mavlink_param_union_double_t will be treated as a little-endian structure.
- *
- * If is_double is 1 then the type is a double, and the remaining 63 bits are the double, with the lowest bit of the mantissa zero.
- * The intention is that by replacing the is_double bit with 0 the type can be directly used as a double (as the is_double bit corresponds to the
- * lowest mantissa bit of a double). If is_double is 0 then mavlink_type gives the type in the union.
- * The mavlink_types.h header will also need to have shifts/masks to define the bit boundaries in the above,
- * as bitfield ordering isn’t consistent between platforms. The above is intended to be for gcc on x86,
- * which should be the same as gcc on little-endian arm. When using shifts/masks the value will be treated as a 64 bit unsigned number,
- * and the bits pulled out using the shifts/masks.
-*/
+ */
 MAVPACKED(
 typedef union {
     struct {
@@ -111,15 +119,29 @@ typedef struct __mavlink_system {
     uint8_t compid;  ///< Used by the MAVLink message_xx_send() convenience function
 }) mavlink_system_t;
 
+/* ============================================================
+ * MAVLINK2 PATCH: message struct
+ * ------------------------------------------------------------
+ * Added incompat_flags / compat_flags (present on every MAVLink2
+ * packet, unused/zero for MAVLink1). Widened msgid from uint8_t
+ * to uint32_t: MAVLink2 message IDs are 24 bits on the wire.
+ * Every message this gimbal actually sends/receives (HEARTBEAT,
+ * GIMBAL_CONTROL, GOPRO_*, PARAM_*, COMMAND_LONG, etc.) has an ID
+ * under 256, so existing generated mavlink_msg_*_pack() code that
+ * does `msg->msgid = MAVLINK_MSG_ID_XXX;` continues to work
+ * unmodified - the assignment just promotes to the wider type.
+ * ============================================================ */
 MAVPACKED(
 typedef struct __mavlink_message {
 	uint16_t checksum; ///< sent at end of packet
-	uint8_t magic;   ///< protocol magic marker
+	uint8_t magic;   ///< protocol magic marker: MAVLINK_STX (v2) or MAVLINK_STX_MAVLINK1 (v1)
 	uint8_t len;     ///< Length of payload
+	uint8_t incompat_flags; ///< MAVLink2 incompatibility flags (0 for MAVLink1 packets)
+	uint8_t compat_flags;   ///< MAVLink2 compatibility flags (0 for MAVLink1 packets)
 	uint8_t seq;     ///< Sequence of packet
 	uint8_t sysid;   ///< ID of message sender system/aircraft
 	uint8_t compid;  ///< ID of the message sender component
-	uint8_t msgid;   ///< ID of message in payload
+	uint32_t msgid;  ///< ID of message in payload (up to 24 bits on the wire for MAVLink2)
 	uint64_t payload64[(MAVLINK_MAX_PAYLOAD_LEN+MAVLINK_NUM_CHECKSUM_BYTES+7)/8];
 }) mavlink_message_t;
 
@@ -190,18 +212,48 @@ typedef enum {
 #endif
 #endif
 
+/* ============================================================
+ * MAVLINK2 PATCH: expanded parse state machine
+ * ------------------------------------------------------------
+ * MAVLink1 and MAVLink2 headers differ in length and content
+ * after the length byte, so the state machine branches based on
+ * which magic byte started the packet (tracked via
+ * MAVLINK_STATUS_FLAG_IN_MAVLINK1, below). MAVLink1 packets skip
+ * the two flag-byte states and only consume one msgid byte;
+ * MAVLink2 packets consume both flag bytes and three msgid bytes.
+ * ============================================================ */
 typedef enum {
     MAVLINK_PARSE_STATE_UNINIT=0,
     MAVLINK_PARSE_STATE_IDLE,
     MAVLINK_PARSE_STATE_GOT_STX,
-    MAVLINK_PARSE_STATE_GOT_SEQ,
     MAVLINK_PARSE_STATE_GOT_LENGTH,
+    MAVLINK_PARSE_STATE_GOT_INCOMPAT_FLAGS, // MAVLink2 only
+    MAVLINK_PARSE_STATE_GOT_COMPAT_FLAGS,   // MAVLink2 only
+    MAVLINK_PARSE_STATE_GOT_SEQ,
     MAVLINK_PARSE_STATE_GOT_SYSID,
     MAVLINK_PARSE_STATE_GOT_COMPID,
-    MAVLINK_PARSE_STATE_GOT_MSGID,
+    MAVLINK_PARSE_STATE_GOT_MSGID1,         // MAVLink2 only (waiting for msgid byte 2)
+    MAVLINK_PARSE_STATE_GOT_MSGID2,         // MAVLink2 only (waiting for msgid byte 3)
+    MAVLINK_PARSE_STATE_GOT_MSGID,          // msgid complete (v1: 1 byte, v2: 3 bytes) - now accumulating payload
     MAVLINK_PARSE_STATE_GOT_PAYLOAD,
     MAVLINK_PARSE_STATE_GOT_CRC1
 } mavlink_parse_state_t; ///< The state machine for the comm parser
+
+/* ============================================================
+ * MAVLINK2 PATCH: per-channel version flags
+ * ------------------------------------------------------------
+ * OUT_MAVLINK1 - set => we TRANSMIT MAVLink1 on this channel.
+ *                Cleared by default (i.e. we transmit MAVLink2
+ *                by default), and also auto-cleared the first
+ *                time we successfully receive a MAVLink2 packet
+ *                from the other end (auto-upgrade), matching the
+ *                behavior of the official MAVLink library.
+ * IN_MAVLINK1   - scratch bit used only while a packet is being
+ *                parsed, to remember which header shape to expect
+ *                for the packet currently in progress.
+ * ============================================================ */
+#define MAVLINK_STATUS_FLAG_OUT_MAVLINK1 0x01
+#define MAVLINK_STATUS_FLAG_IN_MAVLINK1  0x02
 
 typedef struct __mavlink_status {
     uint8_t msg_received;               ///< Number of received messages
@@ -213,6 +265,7 @@ typedef struct __mavlink_status {
     uint8_t current_tx_seq;             ///< Sequence number of last packet sent
     uint16_t packet_rx_success_count;   ///< Received packets
     uint16_t packet_rx_drop_count;      ///< Number of packet drops
+    uint8_t flags;                      ///< MAVLINK_STATUS_FLAG_* bits (MAVLINK2 PATCH)
 } mavlink_status_t;
 
 #define MAVLINK_BIG_ENDIAN 0
